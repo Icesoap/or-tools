@@ -300,9 +300,9 @@ struct AffineExpression {
   AffineExpression(IntegerVariable v)  // NOLINT(runtime/explicit)
       : var(v), coeff(1) {}
   AffineExpression(IntegerVariable v, IntegerValue c)
-      : var(c > 0 ? v : NegationOf(v)), coeff(IntTypeAbs(c)) {}
+      : var(c >= 0 ? v : NegationOf(v)), coeff(IntTypeAbs(c)) {}
   AffineExpression(IntegerVariable v, IntegerValue c, IntegerValue cst)
-      : var(c > 0 ? v : NegationOf(v)), coeff(IntTypeAbs(c)), constant(cst) {}
+      : var(c >= 0 ? v : NegationOf(v)), coeff(IntTypeAbs(c)), constant(cst) {}
 
   // Returns the integer literal corresponding to expression >= value or
   // expression <= value.
@@ -1912,7 +1912,7 @@ inline std::function<void(Model*)> Equality(IntegerVariable v, int64_t value) {
 // is the same as using different underlying variable for an integer literal and
 // its negation.
 inline std::function<void(Model*)> Implication(
-    const std::vector<Literal>& enforcement_literals, IntegerLiteral i) {
+    absl::Span<const Literal> enforcement_literals, IntegerLiteral i) {
   return [=](Model* model) {
     IntegerTrail* integer_trail = model->GetOrCreate<IntegerTrail>();
     if (i.bound <= integer_trail->LowerBound(i.var)) {

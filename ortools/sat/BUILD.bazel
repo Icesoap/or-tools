@@ -13,9 +13,9 @@
 
 # Home of CP/SAT solver (which includes SAT, max-SAT and PB problems).
 
-load("@rules_proto//proto:defs.bzl", "proto_library")
-load("@rules_java//java:defs.bzl", "java_proto_library")
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_proto_library")
+load("@rules_java//java:defs.bzl", "java_proto_library")
+load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@rules_python//python:proto.bzl", "py_proto_library")
 
 package(default_visibility = ["//visibility:public"])
@@ -1090,6 +1090,7 @@ cc_library(
         "//ortools/graph",
         "//ortools/graph:topologicalsorter",
         "//ortools/util:bitset",
+        "//ortools/util:logging",
         "//ortools/util:strong_integers",
         "//ortools/util:time_limit",
         "@com_google_absl//absl/cleanup",
@@ -1138,6 +1139,7 @@ cc_library(
     deps = [
         ":integer",
         ":model",
+        ":precedences",
         ":sat_base",
         ":sat_solver",
         ":synchronization",
@@ -1148,6 +1150,7 @@ cc_library(
         "//ortools/util:strong_integers",
         "//ortools/util:time_limit",
         "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/base:log_severity",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/log",
@@ -1816,7 +1819,6 @@ cc_library(
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/random:bit_gen_ref",
-        "@com_google_absl//absl/random:distributions",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
     ],
@@ -1827,6 +1829,7 @@ cc_library(
     srcs = ["2d_orthogonal_packing.cc"],
     hdrs = ["2d_orthogonal_packing.h"],
     deps = [
+        ":2d_packing_brute_force",
         ":integer",
         ":synchronization",
         ":util",
@@ -1836,6 +1839,21 @@ cc_library(
         "@com_google_absl//absl/numeric:bits",
         "@com_google_absl//absl/random:bit_gen_ref",
         "@com_google_absl//absl/random:distributions",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "2d_packing_brute_force",
+    srcs = ["2d_packing_brute_force.cc"],
+    hdrs = ["2d_packing_brute_force.h"],
+    deps = [
+        ":diffn_util",
+        ":integer",
+        "//ortools/util:bitset",
+        "@com_google_absl//absl/container:inlined_vector",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/types:span",
     ],
 )
@@ -2250,6 +2268,7 @@ cc_library(
         ":integer",
         ":integer_search",
         ":model",
+        ":restart",
         ":sat_base",
         ":sat_parameters_cc_proto",
         ":sat_solver",

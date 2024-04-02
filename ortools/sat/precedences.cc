@@ -42,6 +42,7 @@
 #include "ortools/sat/sat_solver.h"
 #include "ortools/sat/synchronization.h"
 #include "ortools/util/bitset.h"
+#include "ortools/util/logging.h"
 #include "ortools/util/strong_integers.h"
 #include "ortools/util/time_limit.h"
 
@@ -60,8 +61,8 @@ void PrecedenceRelations::Add(IntegerVariable tail, IntegerVariable head,
   // TODO(user): if tail = Negation(head) also update Domain.
   if (tail == head) return;
 
-  AddToHashTable(tail, head, offset);
-  AddToHashTable(NegationOf(head), NegationOf(tail), offset);
+  // Add to root_relations_.
+  AddInternal(tail, head, offset);
 
   // If we are not built, make sure there is enough room in the graph.
   // TODO(user): Alternatively, force caller to do a Resize().
@@ -70,6 +71,105 @@ void PrecedenceRelations::Add(IntegerVariable tail, IntegerVariable head,
   if (!is_built_ && max_node >= graph_.num_nodes()) {
     graph_.AddNode(max_node);
   }
+}
+
+void PrecedenceRelations::PushConditionalRelation(
+    absl::Span<const Literal> enforcements, IntegerVariable a,
+    IntegerVariable b, IntegerValue rhs) {
+  if (enforcements.empty()) {
+    Add(a, NegationOf(b), -rhs);
+    return;
+  }
+
+  // This must be currently true.
+  if (DEBUG_MODE) {
+    for (const Literal l : enforcements) {
+      CHECK(trail_->Assignment().LiteralIsTrue(l));
+    }
+  }
+
+  const int new_index = conditional_stack_.size();
+  const auto key = GetKey(a, b);
+  const auto [it, inserted] = conditional_relations_.insert({key, new_index});
+  if (inserted) {
+    CreateLevelEntryIfNeeded();
+    conditional_stack_.emplace_back(/*prev_entry=*/-1, rhs, key, enforcements);
+  } else {
+    const int prev_entry = it->second;
+    if (conditional_stack_[prev_entry].rhs <= rhs) return;  // ignore.
+
+    // Update.
+    it->second = new_index;
+    CreateLevelEntryIfNeeded();
+    conditional_stack_.emplace_back(prev_entry, rhs, key, enforcements);
+  }
+}
+
+void PrecedenceRelations::CreateLevelEntryIfNeeded() {
+  const int current = trail_->CurrentDecisionLevel();
+  if (!level_to_stack_size_.empty() &&
+      level_to_stack_size_.back().first == current)
+    return;
+  level_to_stack_size_.push_back({current, conditional_stack_.size()});
+}
+
+// We only pop what is needed.
+void PrecedenceRelations::SetLevel(int level) {
+  while (!level_to_stack_size_.empty() &&
+         level_to_stack_size_.back().first > level) {
+    const int target = level_to_stack_size_.back().second;
+    CHECK_GE(conditional_stack_.size(), target);
+    while (conditional_stack_.size() > target) {
+      const ConditionalEntry& back = conditional_stack_.back();
+      if (back.prev_entry != -1) {
+        conditional_relations_[back.key] = back.prev_entry;
+      } else {
+        conditional_relations_.erase(back.key);
+      }
+      conditional_stack_.pop_back();
+    }
+    level_to_stack_size_.pop_back();
+  }
+}
+
+IntegerValue PrecedenceRelations::GetOffset(IntegerVariable a,
+                                            IntegerVariable b) const {
+  const auto it = root_relations_.find(GetKey(a, NegationOf(b)));
+  if (it != root_relations_.end()) {
+    return -it->second;
+  }
+  return kMinIntegerValue;
+}
+
+absl::Span<const Literal> PrecedenceRelations::GetConditionalEnforcements(
+    IntegerVariable a, IntegerVariable b) const {
+  const auto it = conditional_relations_.find(GetKey(a, NegationOf(b)));
+  if (it == conditional_relations_.end()) return {};
+
+  const ConditionalEntry& entry = conditional_stack_[it->second];
+  if (DEBUG_MODE) {
+    for (const Literal l : entry.enforcements) {
+      CHECK(trail_->Assignment().LiteralIsTrue(l));
+    }
+  }
+  const IntegerValue root_level_offset = GetOffset(a, b);
+  const IntegerValue conditional_offset = -entry.rhs;
+  if (conditional_offset <= root_level_offset) return {};
+
+  return entry.enforcements;
+}
+
+// TODO(user): optimize this with a single direct hash lookup?
+IntegerValue PrecedenceRelations::GetConditionalOffset(
+    IntegerVariable a, IntegerVariable b) const {
+  const IntegerValue root_level_offset = GetOffset(a, b);
+  const auto it = conditional_relations_.find(GetKey(a, NegationOf(b)));
+  if (it != conditional_relations_.end()) {
+    const ConditionalEntry& entry = conditional_stack_[it->second];
+    const IntegerValue conditional_offset = -entry.rhs;
+    return std::max(conditional_offset, root_level_offset);
+  }
+  return root_level_offset;
 }
 
 void PrecedenceRelations::Build() {
@@ -84,18 +184,33 @@ void PrecedenceRelations::Build() {
   // And use this to compute the "closure".
   // Note that the non-determinism of the arcs order shouldn't matter.
   CHECK(arc_offsets_.empty());
-  graph_.ReserveArcs(all_relations_.size());
-  for (const auto [var_pair, offset] : all_relations_) {
+  graph_.ReserveArcs(2 * root_relations_.size());
+  for (const auto [var_pair, negated_offset] : root_relations_) {
     // TODO(user): Support negative offset?
     //
     // Note that if we only have >= 0 ones, if we do have a cycle, we could
     // make sure all variales are the same, and otherwise, we have a DAG or a
     // conflict.
+    const IntegerValue offset = -negated_offset;
     if (offset < 0) continue;
-    graph_.AddArc(var_pair.first.value(), var_pair.second.value());
-    arc_offsets_.push_back(offset);
-    CHECK_LT(var_pair.second, before.size());
-    before[var_pair.second].push_back(var_pair.first);
+
+    // We have two arcs.
+    {
+      const IntegerVariable tail = var_pair.first;
+      const IntegerVariable head = NegationOf(var_pair.second);
+      graph_.AddArc(tail.value(), head.value());
+      arc_offsets_.push_back(offset);
+      CHECK_LT(var_pair.second, before.size());
+      before[head].push_back(tail);
+    }
+    {
+      const IntegerVariable tail = var_pair.second;
+      const IntegerVariable head = NegationOf(var_pair.first);
+      graph_.AddArc(tail.value(), head.value());
+      arc_offsets_.push_back(offset);
+      CHECK_LT(var_pair.second, before.size());
+      before[head].push_back(tail);
+    }
   }
 
   std::vector<int> permutation;
@@ -133,16 +248,6 @@ void PrecedenceRelations::Build() {
 
   int work = 0;
   const int kWorkLimit = 1e6;
-  const auto add = [&before, this](IntegerVariable a, IntegerVariable b,
-                                   IntegerValue offset) {
-    const auto [it, inserted] = all_relations_.insert({{a, b}, offset});
-    if (inserted) {
-      before[b].push_back(a);
-    } else {
-      it->second = std::max(it->second, offset);
-    }
-  };
-
   for (const IntegerVariable tail_var : topological_order_) {
     if (++work > kWorkLimit) break;
     for (const int arc : graph_.OutgoingArcs(tail_var.value())) {
@@ -151,19 +256,24 @@ void PrecedenceRelations::Build() {
       const IntegerValue arc_offset = arc_offsets_[arc];
 
       if (++work > kWorkLimit) break;
-      add(tail_var, head_var, arc_offset);
+      if (AddInternal(tail_var, head_var, arc_offset)) {
+        before[head_var].push_back(tail_var);
+      }
 
       for (const IntegerVariable before_var : before[tail_var]) {
         if (++work > kWorkLimit) break;
         const IntegerValue offset =
-            all_relations_.at({before_var, tail_var}) + arc_offset;
-        add(before_var, head_var, offset);
+            -root_relations_.at(GetKey(before_var, NegationOf(tail_var))) +
+            arc_offset;
+        if (AddInternal(before_var, head_var, offset)) {
+          before[head_var].push_back(before_var);
+        }
       }
     }
   }
 
   VLOG(2) << "Full precedences. Work=" << work
-          << " Relations=" << all_relations_.size();
+          << " Relations=" << root_relations_.size();
 }
 
 void PrecedenceRelations::ComputeFullPrecedences(
@@ -296,7 +406,7 @@ bool PrecedencesPropagator::Propagate() {
          literal_to_new_impacted_arcs_[literal.Index()]) {
       if (--arc_counts_[arc_index] == 0) {
         const ArcInfo& arc = arcs_[arc_index];
-        AddToConditionalRelations(arc);
+        PushConditionalRelations(arc);
         impacted_arcs_[arc.tail_var].push_back(arc_index);
       }
     }
@@ -352,34 +462,15 @@ bool PrecedencesPropagator::PropagateOutgoingArcs(IntegerVariable var) {
   return true;
 }
 
-// TODO(user): Add as fixed precedence if we fix at level zero.
-void PrecedencesPropagator::AddToConditionalRelations(const ArcInfo& arc) {
-  if (arc.presence_literals.size() != 1) return;
-
+// TODO(user): Remove literal fixed at level zero from there.
+void PrecedencesPropagator::PushConditionalRelations(const ArcInfo& arc) {
   // We currently do not handle variable size in the reasons.
   // TODO(user): we could easily take a level zero ArcOffset() instead, or
   // add this to the reason though.
   if (arc.offset_var != kNoIntegerVariable) return;
-  const std::pair<IntegerVariable, IntegerVariable> key = {arc.tail_var,
-                                                           arc.head_var};
   const IntegerValue offset = ArcOffset(arc);
-
-  // We only insert if it is not already present!
-  conditional_relations_.insert({key, {arc.presence_literals[0], offset}});
-}
-
-void PrecedencesPropagator::RemoveFromConditionalRelations(const ArcInfo& arc) {
-  if (arc.presence_literals.size() != 1) return;
-  if (arc.offset_var != kNoIntegerVariable) return;
-  const std::pair<IntegerVariable, IntegerVariable> key = {arc.tail_var,
-                                                           arc.head_var};
-  const auto it = conditional_relations_.find(key);
-  if (it == conditional_relations_.end()) return;
-  if (it->second.first != arc.presence_literals[0]) return;
-
-  // It is okay if we erase a wrong one on untrail, what is important is not to
-  // forget to erase one we added.
-  conditional_relations_.erase(it);
+  relations_->PushConditionalRelation(arc.presence_literals, arc.tail_var,
+                                      NegationOf(arc.head_var), -offset);
 }
 
 void PrecedencesPropagator::Untrail(const Trail& trail, int trail_index) {
@@ -396,7 +487,6 @@ void PrecedencesPropagator::Untrail(const Trail& trail, int trail_index) {
          literal_to_new_impacted_arcs_[literal.Index()]) {
       if (arc_counts_[arc_index]++ == 0) {
         const ArcInfo& arc = arcs_[arc_index];
-        RemoveFromConditionalRelations(arc);
         impacted_arcs_[arc.tail_var].pop_back();
       }
     }
@@ -409,7 +499,7 @@ void PrecedencesPropagator::Untrail(const Trail& trail, int trail_index) {
 // permutation.
 void PrecedencesPropagator::ComputePrecedences(
     const std::vector<IntegerVariable>& vars,
-    std::vector<IntegerPrecedences>* output) {
+    std::vector<IntegerPrecedences>* output, bool sort_by_var_lb) {
   tmp_sorted_vars_.clear();
   tmp_precedences_.clear();
   for (int index = 0; index < vars.size(); ++index) {
@@ -419,9 +509,11 @@ void PrecedencesPropagator::ComputePrecedences(
     for (const ArcIndex arc_index : impacted_arcs_[var]) {
       const ArcInfo& arc = arcs_[arc_index];
       IntegerValue offset = arc.offset;
-      if (arc.offset_var != kNoIntegerVariable) {
-        offset += integer_trail_->LowerBound(arc.offset_var);
-      }
+
+      // TODO(user): we don't support linear3 with the new code.
+      // Mainly due to the need for explaining the bound. We could use level
+      // zero bound of linear3 for precedences.
+      if (arc.offset_var != kNoIntegerVariable) continue;
 
       // TODO(user): it seems better to ignore negative min offset as we will
       // often have relation of the form interval_start >= interval_end -
@@ -441,19 +533,20 @@ void PrecedencesPropagator::ComputePrecedences(
       }
       var_to_last_index_[arc.head_var] = index;
       var_to_degree_[arc.head_var]++;
-      tmp_precedences_.push_back(
-          {index, arc.head_var, arc_index.value(), offset});
+      tmp_precedences_.push_back({index, arc.head_var, offset});
     }
   }
 
-  // This order is a topological order for the precedences relation order
-  // provided that all the offset between the involved IntegerVariable are
-  // positive.
-  //
-  // TODO(user): use an order that is always topological? This is not clear
-  // since it may be slower to compute and not worth it because the order below
-  // is more natural and may work better.
-  std::sort(tmp_sorted_vars_.begin(), tmp_sorted_vars_.end());
+  if (sort_by_var_lb) {
+    // This order is a topological order for the precedences relation order
+    // provided that all the offset between the involved IntegerVariable are
+    // positive.
+    //
+    // TODO(user): use an order that is always topological? This is not clear
+    // since it may be slower to compute and not worth it because the order
+    // below is more natural and may work better.
+    std::sort(tmp_sorted_vars_.begin(), tmp_sorted_vars_.end());
+  }
 
   // Permute tmp_precedences_ into the output to put it in the correct order.
   // For that we transform var_to_degree_ to point to the first position of
@@ -503,21 +596,6 @@ void PrecedencesPropagator::ComputePartialPrecedences(
       data.offsets.push_back(before[i].offset);
     }
     output->push_back(std::move(data));
-  }
-}
-
-void PrecedencesPropagator::AddPrecedenceReason(
-    int arc_index, IntegerValue min_offset,
-    std::vector<Literal>* literal_reason,
-    std::vector<IntegerLiteral>* integer_reason) const {
-  const ArcInfo& arc = arcs_[ArcIndex(arc_index)];
-  for (const Literal l : arc.presence_literals) {
-    literal_reason->push_back(l.Negated());
-  }
-  if (arc.offset_var != kNoIntegerVariable) {
-    // Reason for ArcOffset(arc) to be >= min_offset.
-    integer_reason->push_back(IntegerLiteral::GreaterOrEqual(
-        arc.offset_var, min_offset - arc.offset));
   }
 }
 
@@ -1021,112 +1099,174 @@ bool PrecedencesPropagator::BellmanFordTarjan(Trail* trail) {
   return true;
 }
 
-int PrecedencesPropagator::AddGreaterThanAtLeastOneOfConstraintsFromClause(
-    const absl::Span<const Literal> clause, Model* model) {
+void GreaterThanAtLeastOneOfDetector::Add(Literal lit, LinearTerm a,
+                                          LinearTerm b, IntegerValue lhs,
+                                          IntegerValue rhs) {
+  Relation r;
+  r.enforcement = lit;
+  r.a = a;
+  r.b = b;
+  r.lhs = lhs;
+  r.rhs = rhs;
+
+  // We shall only consider positive variable here.
+  if (r.a.var != kNoIntegerVariable && !VariableIsPositive(r.a.var)) {
+    r.a.var = NegationOf(r.a.var);
+    r.a.coeff = -r.a.coeff;
+  }
+  if (r.b.var != kNoIntegerVariable && !VariableIsPositive(r.b.var)) {
+    r.b.var = NegationOf(r.b.var);
+    r.b.coeff = -r.b.coeff;
+  }
+
+  const int index = relations_.size();
+  relations_.push_back(std::move(r));
+
+  if (lit.Index() >= lit_to_relations_.size()) {
+    lit_to_relations_.resize(lit.Index() + 1);
+  }
+  lit_to_relations_[lit.Index()].push_back(index);
+}
+
+bool GreaterThanAtLeastOneOfDetector::AddRelationFromIndices(
+    IntegerVariable var, absl::Span<const Literal> clause,
+    absl::Span<const int> indices, Model* model) {
+  std::vector<AffineExpression> exprs;
+  std::vector<Literal> selectors;
+  absl::flat_hash_set<LiteralIndex> used;
+  auto* integer_trail = model->GetOrCreate<IntegerTrail>();
+
+  const IntegerValue var_lb = integer_trail->LevelZeroLowerBound(var);
+  for (const int index : indices) {
+    Relation r = relations_[index];
+    if (r.a.var != PositiveVariable(var)) std::swap(r.a, r.b);
+    CHECK_EQ(r.a.var, PositiveVariable(var));
+
+    if ((r.a.coeff == 1) == VariableIsPositive(var)) {
+      //  a + b >= lhs
+      if (r.lhs <= kMinIntegerValue) continue;
+      exprs.push_back(AffineExpression(r.b.var, -r.b.coeff, r.lhs));
+    } else {
+      // -a + b <= rhs.
+      if (r.rhs >= kMaxIntegerValue) continue;
+      exprs.push_back(AffineExpression(r.b.var, r.b.coeff, -r.rhs));
+    }
+
+    // Ignore this entry if it is always true.
+    if (var_lb >= integer_trail->LevelZeroUpperBound(exprs.back())) {
+      exprs.pop_back();
+      continue;
+    }
+
+    // Note that duplicate selector are supported.
+    selectors.push_back(r.enforcement);
+    used.insert(r.enforcement);
+  }
+
+  // The enforcement of the new constraint are simply the literal not used
+  // above.
+  std::vector<Literal> enforcements;
+  for (const Literal l : clause) {
+    if (!used.contains(l.Index())) {
+      enforcements.push_back(l.Negated());
+    }
+  }
+
+  // No point adding a constraint if there is not at least two different
+  // literals in selectors.
+  if (used.size() <= 1) return false;
+
+  // Add the constraint.
+  GreaterThanAtLeastOneOfPropagator* constraint =
+      new GreaterThanAtLeastOneOfPropagator(var, exprs, selectors, enforcements,
+                                            model);
+  constraint->RegisterWith(model->GetOrCreate<GenericLiteralWatcher>());
+  model->TakeOwnership(constraint);
+  return true;
+}
+
+int GreaterThanAtLeastOneOfDetector::
+    AddGreaterThanAtLeastOneOfConstraintsFromClause(
+        const absl::Span<const Literal> clause, Model* model) {
   CHECK_EQ(model->GetOrCreate<Trail>()->CurrentDecisionLevel(), 0);
   if (clause.size() < 2) return 0;
 
-  // Collect all arcs impacted by this clause.
-  std::vector<ArcInfo> infos;
+  // Collect all relations impacted by this clause.
+  std::vector<std::pair<IntegerVariable, int>> infos;
   for (const Literal l : clause) {
-    if (l.Index() >= literal_to_new_impacted_arcs_.size()) continue;
-    for (const ArcIndex arc_index : literal_to_new_impacted_arcs_[l.Index()]) {
-      const ArcInfo& arc = arcs_[arc_index];
-      if (arc.presence_literals.size() != 1) continue;
-
-      // TODO(user): Support variable offset.
-      if (arc.offset_var != kNoIntegerVariable) continue;
-      infos.push_back(arc);
+    if (l.Index() >= lit_to_relations_.size()) continue;
+    for (const int index : lit_to_relations_[l.Index()]) {
+      const Relation& r = relations_[index];
+      if (r.a.var != kNoIntegerVariable && IntTypeAbs(r.a.coeff) == 1) {
+        infos.push_back({r.a.var, index});
+      }
+      if (r.b.var != kNoIntegerVariable && IntTypeAbs(r.b.coeff) == 1) {
+        infos.push_back({r.b.var, index});
+      }
     }
   }
   if (infos.size() <= 1) return 0;
 
-  // Stable sort by head_var so that for a same head_var, the entry are sorted
-  // by Literal as they appear in clause.
-  std::stable_sort(infos.begin(), infos.end(),
-                   [](const ArcInfo& a, const ArcInfo& b) {
-                     return a.head_var < b.head_var;
-                   });
+  // Stable sort to regroup by var.
+  std::stable_sort(infos.begin(), infos.end());
 
-  // We process ArcInfo with the same head_var toghether.
+  // We process the info with same variable together.
   int num_added_constraints = 0;
-  auto* solver = model->GetOrCreate<SatSolver>();
+  std::vector<int> indices;
   for (int i = 0; i < infos.size();) {
     const int start = i;
-    const IntegerVariable head_var = infos[start].head_var;
-    for (i++; i < infos.size() && infos[i].head_var == head_var; ++i) {
-    }
-    const absl::Span<ArcInfo> arcs(&infos[start], i - start);
+    const IntegerVariable var = infos[start].first;
 
-    // Skip single arcs since it will already be fully propagated.
-    if (arcs.size() < 2) continue;
-
-    // Heuristic. Look for full or almost full clauses. We could add
-    // GreaterThanAtLeastOneOf() with more enforcement literals. TODO(user):
-    // experiments.
-    if (arcs.size() + 1 < clause.size()) continue;
-
-    std::vector<IntegerVariable> vars;
-    std::vector<IntegerValue> offsets;
-    std::vector<Literal> selectors;
-    std::vector<Literal> enforcements;
-
-    int j = 0;
-    for (const Literal l : clause) {
-      bool added = false;
-      for (; j < arcs.size() && l == arcs[j].presence_literals.front(); ++j) {
-        added = true;
-        vars.push_back(arcs[j].tail_var);
-        offsets.push_back(arcs[j].offset);
-
-        // Note that duplicate selector are supported.
-        //
-        // TODO(user): If we support variable offset, we should regroup the arcs
-        // into one (tail + offset <= head) though, instead of having too
-        // identical entries.
-        selectors.push_back(l);
-      }
-      if (!added) {
-        enforcements.push_back(l.Negated());
-      }
+    indices.clear();
+    for (; i < infos.size() && infos[i].first == var; ++i) {
+      indices.push_back(infos[i].second);
     }
 
-    // No point adding a constraint if there is not at least two different
-    // literals in selectors.
-    if (enforcements.size() + 1 == clause.size()) continue;
+    // Skip single relations, we are not interested in these.
+    if (indices.size() < 2) continue;
 
-    ++num_added_constraints;
-    model->Add(GreaterThanAtLeastOneOf(head_var, vars, offsets, selectors,
-                                       enforcements));
-    if (!solver->FinishPropagation()) return num_added_constraints;
+    // Heuristic. Look for full or almost full clauses.
+    //
+    // TODO(user): We could add GreaterThanAtLeastOneOf() with more enforcement
+    // literals. Experiment.
+    if (indices.size() + 1 < clause.size()) continue;
+
+    if (AddRelationFromIndices(var, clause, indices, model)) {
+      ++num_added_constraints;
+    }
+    if (AddRelationFromIndices(NegationOf(var), clause, indices, model)) {
+      ++num_added_constraints;
+    }
   }
   return num_added_constraints;
 }
 
-int PrecedencesPropagator::
+int GreaterThanAtLeastOneOfDetector::
     AddGreaterThanAtLeastOneOfConstraintsWithClauseAutoDetection(Model* model) {
   auto* time_limit = model->GetOrCreate<TimeLimit>();
   auto* solver = model->GetOrCreate<SatSolver>();
 
-  // Fill the set of incoming conditional arcs for each variables.
-  absl::StrongVector<IntegerVariable, std::vector<ArcIndex>> incoming_arcs_;
-  for (ArcIndex arc_index(0); arc_index < arcs_.size(); ++arc_index) {
-    const ArcInfo& arc = arcs_[arc_index];
-
-    // Only keep arc that have a fixed offset and a single presence_literals.
-    if (arc.offset_var != kNoIntegerVariable) continue;
-    if (arc.tail_var == arc.head_var) continue;
-    if (arc.presence_literals.size() != 1) continue;
-
-    if (arc.head_var >= incoming_arcs_.size()) {
-      incoming_arcs_.resize(arc.head_var.value() + 1);
+  // Fill the set of interesting relations for each variables.
+  absl::StrongVector<IntegerVariable, std::vector<int>> var_to_relations;
+  for (int index = 0; index < relations_.size(); ++index) {
+    const Relation& r = relations_[index];
+    if (r.a.var != kNoIntegerVariable && IntTypeAbs(r.a.coeff) == 1) {
+      if (r.a.var >= var_to_relations.size()) {
+        var_to_relations.resize(r.a.var + 1);
+      }
+      var_to_relations[r.a.var].push_back(index);
     }
-    incoming_arcs_[arc.head_var].push_back(arc_index);
+    if (r.b.var != kNoIntegerVariable && IntTypeAbs(r.b.coeff) == 1) {
+      if (r.b.var >= var_to_relations.size()) {
+        var_to_relations.resize(r.b.var + 1);
+      }
+      var_to_relations[r.b.var].push_back(index);
+    }
   }
 
   int num_added_constraints = 0;
-  for (IntegerVariable target(0); target < incoming_arcs_.size(); ++target) {
-    if (incoming_arcs_[target].size() <= 1) continue;
+  for (IntegerVariable target(0); target < var_to_relations.size(); ++target) {
+    if (var_to_relations[target].size() <= 1) continue;
     if (time_limit->LimitReached()) return num_added_constraints;
 
     // Detect set of incoming arcs for which at least one must be present.
@@ -1135,55 +1275,56 @@ int PrecedencesPropagator::
     solver->Backtrack(0);
     if (solver->ModelIsUnsat()) return num_added_constraints;
     std::vector<Literal> clause;
-    for (const ArcIndex arc_index : incoming_arcs_[target]) {
-      const Literal literal = arcs_[arc_index].presence_literals.front();
+    for (const int index : var_to_relations[target]) {
+      const Literal literal = relations_[index].enforcement;
       if (solver->Assignment().LiteralIsFalse(literal)) continue;
       const SatSolver::Status status =
           solver->EnqueueDecisionAndBacktrackOnConflict(literal.Negated());
       if (status == SatSolver::INFEASIBLE) return num_added_constraints;
       if (status == SatSolver::ASSUMPTIONS_UNSAT) {
+        // We need to invert it, since a clause is not all false.
         clause = solver->GetLastIncompatibleDecisions();
+        for (Literal& ref : clause) ref = ref.Negated();
         break;
       }
     }
     solver->Backtrack(0);
+    if (clause.size() <= 1) continue;
 
-    if (clause.size() > 1) {
-      // Extract the set of arc for which at least one must be present.
-      const absl::btree_set<Literal> clause_set(clause.begin(), clause.end());
-      std::vector<ArcIndex> arcs_in_clause;
-      for (const ArcIndex arc_index : incoming_arcs_[target]) {
-        const Literal literal(arcs_[arc_index].presence_literals.front());
-        if (clause_set.contains(literal.Negated())) {
-          arcs_in_clause.push_back(arc_index);
-        }
+    // Recover the indices corresponding to this clause.
+    const absl::btree_set<Literal> clause_set(clause.begin(), clause.end());
+
+    std::vector<int> indices;
+    for (const int index : var_to_relations[target]) {
+      const Literal literal = relations_[index].enforcement;
+      if (clause_set.contains(literal)) {
+        indices.push_back(index);
       }
+    }
 
-      VLOG(2) << arcs_in_clause.size() << "/" << incoming_arcs_[target].size();
-
+    // Try both direction.
+    if (AddRelationFromIndices(target, clause, indices, model)) {
       ++num_added_constraints;
-      std::vector<IntegerVariable> vars;
-      std::vector<IntegerValue> offsets;
-      std::vector<Literal> selectors;
-      for (const ArcIndex a : arcs_in_clause) {
-        vars.push_back(arcs_[a].tail_var);
-        offsets.push_back(arcs_[a].offset);
-        selectors.push_back(Literal(arcs_[a].presence_literals.front()));
-      }
-      model->Add(GreaterThanAtLeastOneOf(target, vars, offsets, selectors, {}));
-      if (!solver->FinishPropagation()) return num_added_constraints;
+    }
+    if (AddRelationFromIndices(NegationOf(target), clause, indices, model)) {
+      ++num_added_constraints;
     }
   }
 
+  solver->Backtrack(0);
   return num_added_constraints;
 }
 
-int PrecedencesPropagator::AddGreaterThanAtLeastOneOfConstraints(Model* model) {
-  VLOG(1) << "Detecting GreaterThanAtLeastOneOf() constraints...";
+int GreaterThanAtLeastOneOfDetector::AddGreaterThanAtLeastOneOfConstraints(
+    Model* model, bool auto_detect_clauses) {
   auto* time_limit = model->GetOrCreate<TimeLimit>();
   auto* solver = model->GetOrCreate<SatSolver>();
   auto* clauses = model->GetOrCreate<ClauseManager>();
+  auto* logger = model->GetOrCreate<SolverLogger>();
+
   int num_added_constraints = 0;
+  SOLVER_LOG(logger, "[Precedences] num_relations=", relations_.size(),
+             " num_clauses=", clauses->AllClausesInCreationOrder().size());
 
   // We have two possible approaches. For now, we prefer the first one except if
   // there is too many clauses in the problem.
@@ -1191,7 +1332,8 @@ int PrecedencesPropagator::AddGreaterThanAtLeastOneOfConstraints(Model* model) {
   // TODO(user): Do more extensive experiment. Remove the second approach as
   // it is more time consuming? or identify when it make sense. Note that the
   // first approach also allows to use "incomplete" at least one between arcs.
-  if (clauses->AllClausesInCreationOrder().size() < 1e6) {
+  if (!auto_detect_clauses &&
+      clauses->AllClausesInCreationOrder().size() < 1e6) {
     // TODO(user): This does not take into account clause of size 2 since they
     // are stored in the BinaryImplicationGraph instead. Some ideas specific
     // to size 2:
@@ -1229,10 +1371,14 @@ int PrecedencesPropagator::AddGreaterThanAtLeastOneOfConstraints(Model* model) {
   }
 
   if (num_added_constraints > 0) {
-    SOLVER_LOG(model->GetOrCreate<SolverLogger>(), "[Precedences] Added ",
-               num_added_constraints,
+    SOLVER_LOG(logger, "[Precedences] Added ", num_added_constraints,
                " GreaterThanAtLeastOneOf() constraints.");
   }
+
+  // Release the memory, it is not longer needed.
+  gtl::STLClearObject(&relations_);
+  gtl::STLClearObject(&lit_to_relations_);
+
   return num_added_constraints;
 }
 

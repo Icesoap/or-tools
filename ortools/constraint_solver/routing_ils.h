@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 
+#include "absl/time/time.h"
 #include "ortools/constraint_solver/constraint_solver.h"
 #include "ortools/constraint_solver/routing.h"
 #include "ortools/constraint_solver/routing_parameters.pb.h"
@@ -38,7 +39,8 @@ class RuinProcedure {
 // Remove a number of routes that are spatially close together.
 class CloseRoutesRemovalRuinProcedure : public RuinProcedure {
  public:
-  CloseRoutesRemovalRuinProcedure(RoutingModel* model, size_t num_routes);
+  CloseRoutesRemovalRuinProcedure(RoutingModel* model, std::mt19937* rnd,
+                                  size_t num_routes);
   // Returns next accessors where at most num_routes routes have been shortcut,
   // i.e., next(shortcut route begin) = shortcut route end.
   // Next accessors for customers belonging to shortcut routes are still set to
@@ -61,21 +63,32 @@ class CloseRoutesRemovalRuinProcedure : public RuinProcedure {
 // Local Search approach.
 DecisionBuilder* MakePerturbationDecisionBuilder(
     const RoutingSearchParameters& parameters, RoutingModel* model,
-    const Assignment* assignment, std::function<bool()> stop_search,
+    std::mt19937* rnd, const Assignment* assignment,
+    std::function<bool()> stop_search,
     LocalSearchFilterManager* filter_manager);
 
 // Neighbor acceptance criterion interface.
 class NeighborAcceptanceCriterion {
  public:
+  // Representation of the search process state.
+  struct SearchState {
+    // Search duration.
+    absl::Duration duration;
+    // Explored solutions.
+    int64_t solutions;
+  };
+
   virtual ~NeighborAcceptanceCriterion() = default;
-  // Returns whether `candidate` should replace `reference`.
-  virtual bool Accept(const Assignment* candidate,
-                      const Assignment* reference) const = 0;
+  // Returns whether `candidate` should replace `reference` given the provided
+  // search state.
+  virtual bool Accept(const SearchState& search_state,
+                      const Assignment* candidate,
+                      const Assignment* reference) = 0;
 };
 
 // Returns a neighbor acceptance criterion based on the given parameters.
 std::unique_ptr<NeighborAcceptanceCriterion> MakeNeighborAcceptanceCriterion(
-    const RoutingSearchParameters& parameters);
+    const RoutingSearchParameters& parameters, std::mt19937* rnd);
 
 }  // namespace operations_research
 
